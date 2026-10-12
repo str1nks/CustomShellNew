@@ -41,14 +41,14 @@ from pathlib import Path
 from PyQt6.QtCore import QFileInfo, QItemSelectionModel, QRect, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QFileDialog, QFileIconProvider, QFrame,
-    QGridLayout, QHBoxLayout, QHeaderView, QListWidgetItem, QMenu,
+    QAbstractItemView, QApplication, QBoxLayout, QFileDialog, QFileIconProvider, QFrame,
+    QGridLayout, QHBoxLayout, QHeaderView, QLayout, QListWidgetItem, QMenu,
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, ComboBox, FluentIcon as FIF, FluentWindow, InfoBar,
     InfoBarIcon, InfoBarPosition, LineEdit, ListWidget, MessageBox,
-    MessageBoxBase, PrimaryPushButton, PushButton, SearchLineEdit,
+    MessageBoxBase, PrimaryPushButton, PushButton, ScrollArea, SearchLineEdit,
     SegmentedWidget, StrongBodyLabel, SubtitleLabel, SwitchButton,
     TableWidget, Theme, TitleLabel, setTheme, themeColor,
 )
@@ -603,6 +603,114 @@ def fic(name: str):
     return getattr(FIF, name, FIF.INFO)
 
 
+# ─────────────────── Адаптивная раскладка (чтобы окно можно было сжимать) ───────────────────
+
+class WrapLayout(QLayout):
+    """Раскладка «в строку с переносом»: если виджеты не помещаются по ширине, они уходят на следующую строку."""
+
+    def __init__(self, parent=None, hspacing: int = 8, vspacing: int = 8):
+        super().__init__(parent)
+        self._items: list = []
+        self._h, self._v = hspacing, vspacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        return self._do(QRect(0, 0, w, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for it in self._items:
+            size = size.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do(self, rect: QRect, test: bool) -> int:
+        m = self.contentsMargins()
+        area = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = area.x(), area.y(), 0
+        for it in self._items:
+            if it.widget() is not None and it.widget().isHidden():
+                continue
+            hint = it.sizeHint()
+            w = min(hint.width(), max(area.width(), 1))
+            if x + w > area.right() + 1 and line_h > 0:
+                x = area.x()
+                y += line_h + self._v
+                line_h = 0
+            if not test:
+                it.setGeometry(QRect(x, y, w, hint.height()))
+            x += w + self._h
+            line_h = max(line_h, hint.height())
+        return y + line_h - rect.y() + m.top() + m.bottom()
+
+
+def flow_row(parent_layout: QVBoxLayout, hspacing: int = 8, vspacing: int = 8) -> WrapLayout:
+    """Ряд виджетов с переносом строк внутри вертикальной раскладки страницы."""
+    holder = QWidget()
+    lay = WrapLayout(holder, hspacing, vspacing)
+    parent_layout.addWidget(holder)
+    return lay
+
+
+def wrapped(label):
+    label.setWordWrap(True)
+    return label
+
+
+def fit_width(parent, want: int = 520) -> int:
+    """Ширина диалога: не больше окна приложения."""
+    try:
+        return max(280, min(want, parent.width() - 80))
+    except Exception:  # noqa: BLE001
+        return want
+
+
+class ScrollPage(QWidget):
+    """Страница с прокруткой: если окно меньше содержимого — появляются полосы прокрутки,
+    а не «ломается» раскладка. Содержимое строится в self.content."""
+
+    def __init__(self):
+        super().__init__()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self._scroll = ScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.content = QWidget()
+        self.content.setObjectName("pageContent")
+        self._scroll.setWidget(self.content)
+        self.content.setAutoFillBackground(False)
+        self._scroll.viewport().setAutoFillBackground(False)
+        self._scroll.setStyleSheet("QScrollArea{background:transparent;border:none}")
+        self.content.setStyleSheet("#pageContent{background:transparent}")
+        outer.addWidget(self._scroll)
+
+
 # ─────────────────────────────── Диалог ───────────────────────────────
 
 class EntryDialog(MessageBoxBase):
@@ -649,7 +757,7 @@ class EntryDialog(MessageBoxBase):
 
         self.yesButton.setText("Сохранить")
         self.cancelButton.setText("Отмена")
-        self.widget.setMinimumWidth(520)
+        self.widget.setMinimumWidth(fit_width(parent, 520))
 
     def _row(self, caption, edit, button=None):
         self.viewLayout.addWidget(CaptionLabel(caption))
@@ -705,7 +813,7 @@ class EntryDialog(MessageBoxBase):
 
 # ─────────────────────────────── Страницы ───────────────────────────────
 
-class NewMenuPage(QWidget):
+class NewMenuPage(ScrollPage):
     def __init__(self, win: "MainWindow"):
         super().__init__()
         self.setObjectName("newMenuPage")
@@ -723,77 +831,74 @@ class NewMenuPage(QWidget):
         except Exception:
             self.locked_now = False
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self.content)
         root.setContentsMargins(32, 20, 32, 20)
         root.setSpacing(10)
 
         root.addWidget(TitleLabel("Меню «Создать»"))
-        root.addWidget(BodyLabel("Все пункты меню ПКМ → Создать, включая добавленные приложениями. "
-                                 "Справа — предпросмотр в том порядке, который будет в Проводнике."))
+        root.addWidget(wrapped(BodyLabel("Все пункты меню ПКМ → Создать, включая добавленные приложениями. "
+                                         "Справа (или ниже) — предпросмотр в том порядке, который будет в Проводнике.")))
 
         if not is_admin():
-            bar = InfoBar(icon=InfoBarIcon.WARNING, title="Нет прав администратора",
-                          content="Порядок и скрытие работают, но шаблоны, названия и удаление "
-                                  "системных ключей реестра могут не сработать.",
-                          orient=Qt.Orientation.Horizontal, isClosable=False,
-                          position=InfoBarPosition.NONE, duration=-1, parent=self)
+            bar = SimpleCardWidget(self.content)
+            bl = QVBoxLayout(bar)
+            bl.setContentsMargins(14, 10, 14, 10)
+            bl.setSpacing(6)
+            bl.addWidget(wrapped(StrongBodyLabel("Нет прав администратора")))
+            bl.addWidget(wrapped(CaptionLabel("Порядок и скрытие работают, но шаблоны, названия и удаление "
+                                              "системных ключей реестра могут не сработать.")))
             b = PushButton("Перезапустить от администратора")
             b.clicked.connect(self.relaunch_admin)
-            bar.addWidget(b)
+            brow = flow_row(bl)
+            brow.addWidget(b)
             root.addWidget(bar)
 
         self.warn = CaptionLabel("Windows ещё не сформировала список меню. Откройте в Проводнике "
                                  "ПКМ → Создать, затем нажмите «Обновить».")
+        self.warn.setWordWrap(True)
         self.warn.setStyleSheet("color:#d13438;")
         root.addWidget(self.warn)
 
-        # поиск + фильтр
-        top = QHBoxLayout()
+        # поиск + фильтр (ряд переносится на новую строку, если не хватает ширины)
+        top = flow_row(root, 12, 8)
         self.search = SearchLineEdit()
         self.search.setPlaceholderText("Поиск по названию или расширению")
-        self.search.setFixedWidth(320)
+        self.search.setFixedWidth(300)
         self.search.textChanged.connect(self.refilter)
         self.seg = SegmentedWidget()
         for key, text in (("all", "Все"), ("on", "В меню"), ("off", "Скрытые")):
             self.seg.addItem(key, text, onClick=lambda _=False, k=key: self.set_filter(k))
         self.seg.setCurrentItem("all")
         top.addWidget(self.search)
-        top.addSpacing(12)
         top.addWidget(self.seg)
-        top.addStretch(1)
         self.stats = CaptionLabel("")
         top.addWidget(self.stats)
-        root.addLayout(top)
 
         # действия
-        btns = QHBoxLayout()
+        btns = flow_row(root)
         self._btn(btns, PrimaryPushButton(fic("ADD"), "Добавить", self), self.add)
         self._btn(btns, PushButton(fic("EDIT"), "Изменить", self), self.edit)
         self._btn(btns, PushButton(fic("DELETE"), "Удалить", self), self.remove)
-        btns.addSpacing(16)
         self._btn(btns, PushButton(fic("UP"), "Выше", self), lambda: self.move(-1))
         self._btn(btns, PushButton(fic("DOWN"), "Ниже", self), lambda: self.move(1))
-        btns.addStretch(1)
-        root.addLayout(btns)
 
         # закрепление и сервис
-        svc = QHBoxLayout()
+        svc = flow_row(root, 10, 8)
         svc.addWidget(BodyLabel("Закрепить меню:"))
         self.lock_sw = SwitchButton()
         self.lock_sw.setOnText("Да")
         self.lock_sw.setOffText("Нет")
         self.lock_sw.checkedChanged.connect(self.on_lock)
         svc.addWidget(self.lock_sw)
-        svc.addWidget(CaptionLabel("— без этого Проводник сам вернёт порядок и скрытые пункты "
-                                   "(но и новые программы не смогут добавить свои)"))
-        svc.addStretch(1)
         self._btn(svc, PushButton(fic("SYNC"), "Обновить", self), self.reload)
         self._btn(svc, PushButton(fic("ROTATE"), "Перезапустить Проводник", self), self.restart_explorer)
         self._btn(svc, PushButton(fic("CANCEL"), "Сбросить", self), self.reset)
-        root.addLayout(svc)
+        root.addWidget(wrapped(CaptionLabel("Закрепить меню — без этого Проводник сам вернёт порядок и скрытые "
+                                            "пункты (но и новые программы не смогут добавить свои).")))
 
-        # таблица + предпросмотр
-        body = QHBoxLayout()
+        # таблица + предпросмотр (в узком окне предпросмотр уходит под таблицу)
+        body = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self.body_lay = body
         body.setSpacing(16)
         self.table = TableWidget(self)
         self.table.setColumnCount(5)
@@ -806,6 +911,7 @@ class NewMenuPage(QWidget):
         self.table.setIconSize(QSize(22, 22))
         self.table.setBorderVisible(True)
         self.table.setBorderRadius(8)
+        self.table.setMinimumHeight(260)
         h = self.table.horizontalHeader()
         h.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         for c in (0, 2, 3, 4):
@@ -820,6 +926,7 @@ class NewMenuPage(QWidget):
         self.preview.setIconSize(QSize(20, 20))
         self.preview.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.preview.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.preview.setMinimumHeight(160)
         right.addWidget(self.preview, 1)
         note = CaptionLabel("Проводник может закреплять «Папку» и «Ярлык» отдельной группой вверху "
                             "независимо от порядка. Пункты приложений (Paint и т.п.) можно скрывать "
@@ -843,6 +950,16 @@ class NewMenuPage(QWidget):
     def _btn(layout, button, slot):
         button.clicked.connect(slot)
         layout.addWidget(button)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if getattr(self, "table", None) is None:
+            return
+        w = self.width()
+        d = QBoxLayout.Direction.TopToBottom if w < 880 else QBoxLayout.Direction.LeftToRight
+        if self.body_lay.direction() != d:
+            self.body_lay.setDirection(d)
+        self.table.setColumnHidden(3, w < 720)     # колонка «Тип» — первой уступает место
 
     # ── служебное ──
     def toast(self, kind: str, title: str, text: str = ""):
@@ -1110,18 +1227,18 @@ class NewMenuPage(QWidget):
             self.guarded(restart_explorer, "Проводник перезапущен")
 
 
-class BackupPage(QWidget):
+class BackupPage(ScrollPage):
     def __init__(self, win: "MainWindow"):
         super().__init__()
         self.setObjectName("backupPage")
         self.win = win
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self.content)
         root.setContentsMargins(32, 20, 32, 20)
         root.setSpacing(12)
         root.addWidget(TitleLabel("Резервные копии"))
-        root.addWidget(BodyLabel("Копии создаются автоматически перед удалением элемента из реестра."))
+        root.addWidget(wrapped(BodyLabel("Копии создаются автоматически перед удалением элемента из реестра.")))
 
-        row = QHBoxLayout()
+        row = flow_row(root)
         res = PrimaryPushButton(fic("HISTORY"), "Восстановить", self)
         dele = PushButton(fic("DELETE"), "Удалить копию", self)
         opn = PushButton(fic("FOLDER"), "Открыть папку", self)
@@ -1130,10 +1247,9 @@ class BackupPage(QWidget):
         opn.clicked.connect(self.open_folder)
         for b in (res, dele, opn):
             row.addWidget(b)
-        row.addStretch(1)
-        root.addLayout(row)
 
         self.list = ListWidget()
+        self.list.setMinimumHeight(220)
         root.addWidget(self.list, 1)
         self.refresh()
 
@@ -1589,14 +1705,14 @@ class GhostDialog(MessageBoxBase):
         stop = PushButton("Остановить")
         stop.clicked.connect(self._stop)
         self.buttonLayout.addWidget(stop)
-        self.widget.setMinimumWidth(520)
+        self.widget.setMinimumWidth(fit_width(parent, 520))
 
     def _stop(self):
         self.stopped = True
         self.reject()
 
 
-class StartMenuPage(QWidget):
+class StartMenuPage(ScrollPage):
     _loaded = pyqtSignal(list, dict)
     _icons = pyqtSignal(dict)
     _ghosts = pyqtSignal(list, str)
@@ -1620,30 +1736,29 @@ class StartMenuPage(QWidget):
         self._icons.connect(self._on_icons)
         self._ghosts.connect(self._on_ghosts)
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self.content)
         root.setContentsMargins(32, 20, 32, 20)
         root.setSpacing(10)
         root.addWidget(TitleLabel("Пуск"))
-        root.addWidget(BodyLabel("Категория каждого приложения в разделе «Все» меню «Пуск» (режим «По категориям»). "
-                                 "Перетаскивайте приложения мышью в нужную категорию — можно сразу несколько "
-                                 "(Ctrl / Shift). Правая кнопка мыши — «Переместить в…»."))
+        root.addWidget(wrapped(BodyLabel("Категория каждого приложения в разделе «Все» меню «Пуск» (режим «По категориям»). "
+                                         "Перетаскивайте приложения мышью в нужную категорию — можно сразу несколько "
+                                         "(Ctrl / Shift). Правая кнопка мыши — «Переместить в…».")))
 
         self.warn = CaptionLabel("В реестре нет приложений с категорией. Откройте «Пуск» → «Все» в режиме "
                                  "«По категориям» и нажмите «Обновить».")
+        self.warn.setWordWrap(True)
         self.warn.setStyleSheet("color:#d13438;")
         self.warn.hide()
         root.addWidget(self.warn)
 
-        top = QHBoxLayout()
+        top = flow_row(root, 10, 8)
         self.search = SearchLineEdit()
         self.search.setPlaceholderText("Поиск по названию или ключу реестра")
         self.search.setFixedWidth(260)
         self.search.textChanged.connect(self.refilter)
         top.addWidget(self.search)
-        top.addStretch(1)
         self.stats = CaptionLabel("")
         top.addWidget(self.stats)
-        top.addSpacing(12)
         self.btn_ghosts = PushButton(fic("SEARCH"), "Найти удалённые", self)
         for btn, slot in ((PushButton(fic("SYNC"), "Обновить", self), self.reload),
                           (PushButton(fic("CLEAR_SELECTION"), "Разгруппировать", self), self.ungroup),
@@ -1652,13 +1767,16 @@ class StartMenuPage(QWidget):
                           (PushButton(fic("ROTATE"), "Перезапустить Проводник", self), self.restart)):
             btn.clicked.connect(slot)
             top.addWidget(btn)
-        root.addLayout(top)
 
-        # доска категорий: сетка из COLS колонок, каждая ячейка — карточка со своим списком
-        grid = QGridLayout()
-        grid.setSpacing(10)
+        # доска категорий: число колонок подстраивается под ширину окна (до COLS),
+        # каждая ячейка — карточка со своим списком
+        self.grid = QGridLayout()
+        self.grid.setSpacing(10)
+        self.cards: list = []
+        self._cols = 0
         for i, (name, value, _) in enumerate(START_CATS):
-            card = SimpleCardWidget(self)
+            card = SimpleCardWidget(self.content)
+            card.setMinimumSize(150, 160)
             cl = QVBoxLayout(card)
             cl.setContentsMargins(10, 10, 10, 10)
             cl.setSpacing(6)
@@ -1673,26 +1791,46 @@ class StartMenuPage(QWidget):
             lst.dropped.connect(self._on_drop)
             lst.itemSelectionChanged.connect(lambda l=lst: self._on_sel(l))
             lst.customContextMenuRequested.connect(lambda pos, l=lst: self._context_menu(l, pos))
+            lst.setMinimumHeight(90)
             cl.addWidget(lst, 1)
-            grid.addWidget(card, i // self.COLS, i % self.COLS)
+            self.cards.append(card)
             self.lists[value] = lst
             self.counts[value] = cnt
-        for c in range(self.COLS):
-            grid.setColumnStretch(c, 1)
-        for r in range((len(START_CATS) + self.COLS - 1) // self.COLS):
-            grid.setRowStretch(r, 1)
-        root.addLayout(grid, 1)
+        self._layout_cards()
+        root.addLayout(self.grid, 1)
 
         self.detail = CaptionLabel("")
         self.detail.setWordWrap(True)
         self.detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(self.detail)
-        root.addWidget(CaptionLabel("Изменения применяются после перезапуска Проводника (или повторного входа в "
-                                    "систему). Перед первым изменением за сеанс программа сохраняет копию "
-                                    "всех категорий. Номера категорий в Windows не документированы."))
+        root.addWidget(wrapped(CaptionLabel("Изменения применяются после перезапуска Проводника (или повторного входа в "
+                                            "систему). Перед первым изменением за сеанс программа сохраняет копию "
+                                            "всех категорий. Номера категорий в Windows не документированы.")))
         self.show_detail()
 
         QTimer.singleShot(0, self.reload)
+
+    # ── адаптивная сетка категорий ──
+    def _layout_cards(self):
+        avail = self.width() - 64 - 20                      # поля страницы + запас под полосу прокрутки
+        cols = max(1, min(self.COLS, avail // 165))
+        if cols == self._cols:
+            return
+        self._cols = cols
+        for card in self.cards:
+            self.grid.removeWidget(card)
+        for i, card in enumerate(self.cards):
+            self.grid.addWidget(card, i // cols, i % cols)
+        rows = (len(self.cards) + cols - 1) // cols
+        for c in range(self.COLS):
+            self.grid.setColumnStretch(c, 1 if c < cols else 0)
+        for r in range(len(self.cards)):
+            self.grid.setRowStretch(r, 1 if r < rows else 0)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if getattr(self, "cards", None):
+            self._layout_cards()
 
     # ── служебное ──
     def toast(self, kind: str, title: str, text: str = ""):
@@ -2009,7 +2147,7 @@ class MainWindow(FluentWindow):
         """Размер по умолчанию подгоняется под экран и центрируется; прошлые позиция/размер запоминаются."""
         scr = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         area = scr.availableGeometry()
-        self.setMinimumSize(min(900, area.width()), min(560, area.height()))
+        self.setMinimumSize(min(640, area.width()), min(480, area.height()))
         w, h = min(1200, int(area.width() * 0.9)), min(780, int(area.height() * 0.9))
         rect = QRect(area.x() + (area.width() - w) // 2, area.y() + (area.height() - h) // 2, w, h)
         try:
@@ -2023,6 +2161,12 @@ class MainWindow(FluentWindow):
                     break
         except Exception:  # noqa: BLE001
             pass
+        # окно никогда не должно быть больше экрана или выходить за его края
+        a = (QApplication.screenAt(rect.center()) or scr).availableGeometry()
+        rect.setWidth(min(rect.width(), a.width()))
+        rect.setHeight(min(rect.height(), a.height()))
+        rect.moveLeft(max(a.left(), min(rect.left(), a.right() - rect.width() + 1)))
+        rect.moveTop(max(a.top(), min(rect.top(), a.bottom() - rect.height() + 1)))
         self.setGeometry(rect)
 
     def closeEvent(self, e):

@@ -18,6 +18,10 @@ CustomShellNew (CSNew) — менеджер меню «Создать» (кон�
 
 2) Ключи ShellNew в HKCR\\.расширение (шаблоны, названия, значки, удаление, добавление новых типов).
    Отключение пункта дополнительно переименовывает ShellNew -> ShellNew.disabled.
+
+3) Вкладка «Пуск»: категория каждого приложения в разделе «Все» меню «Пуск» (режим «По категориям»), перетаскиванием:
+       HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Start\\TileProperties\\<приложение>
+       значение "Category" (REG_DWORD). Права администратора не нужны.
 """
 import base64
 import ctypes
@@ -27,25 +31,31 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import uuid
 import winreg
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import QFileInfo, QSize, Qt, QTimer
-from PyQt6.QtGui import QIcon, QKeySequence, QShortcut
+from PyQt6.QtCore import QFileInfo, QItemSelectionModel, QRect, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QCursor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QFileDialog, QFileIconProvider,
-    QHBoxLayout, QHeaderView, QListWidgetItem, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QFileDialog, QFileIconProvider, QFrame,
+    QGridLayout, QHBoxLayout, QHeaderView, QListWidgetItem, QMenu,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
-    BodyLabel, CaptionLabel, FluentIcon as FIF, FluentWindow, InfoBar,
+    BodyLabel, CaptionLabel, ComboBox, FluentIcon as FIF, FluentWindow, InfoBar,
     InfoBarIcon, InfoBarPosition, LineEdit, ListWidget, MessageBox,
     MessageBoxBase, PrimaryPushButton, PushButton, SearchLineEdit,
     SegmentedWidget, StrongBodyLabel, SubtitleLabel, SwitchButton,
-    TableWidget, Theme, TitleLabel, setTheme,
+    TableWidget, Theme, TitleLabel, setTheme, themeColor,
 )
+try:
+    from qfluentwidgets import SimpleCardWidget
+except ImportError:          # старые версии библиотеки
+    SimpleCardWidget = QFrame
 
 # ───────────────────────────── Реестр: общее ─────────────────────────────
 
@@ -69,6 +79,7 @@ if _OLD_APP_DIR.exists() and not APP_DIR.exists():   # перенос бэкап
 BACKUPS = APP_DIR / "backups"
 TEMPLATES = APP_DIR / "templates"
 STATE_FILE = APP_DIR / "state.json"
+WINDOW_FILE = APP_DIR / "window.json"
 
 SPECIAL_NAMES = {"Folder": "Папку", ".lnk": "Ярлык", ".library-ms": "Библиотеку",
                  "Briefcase": "Портфель"}
@@ -1169,18 +1180,860 @@ class BackupPage(QWidget):
         os.startfile(BACKUPS)  # noqa: S606
 
 
+# ───────────────────── Пуск: категории приложений ─────────────────────
+
+START_KEY = r"Software\Microsoft\Windows\CurrentVersion\Start\TileProperties"
+START_BACKUPS = APP_DIR / "start_backups"
+SW = winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY
+
+# (название, номер для записи, все номера этой категории). Microsoft значения не документирует —
+# в одну категорию входит несколько номеров (подкатегории). Порядок = порядок плиток на доске.
+START_CATS = [
+    ("Другое", 0, (0,)),
+    ("Специальные возможности", 1, (1,)),
+    ("Производительность", 5, (2, 5, 13)),
+    ("Игры", 3, (3,)),
+    ("Путешествия", 4, (4,)),
+    ("Креативность", 7, (6, 7, 22, 23, 30)),
+    ("Социальные сети", 8, (8,)),
+    ("Служебные программы и средства", 9, (9,)),
+    ("Дети и семья", 10, (10,)),
+    ("Медицина", 11, (11,)),
+    ("Здоровье и фитнес", 12, (12,)),
+    ("Информация и чтение", 14, (14, 21, 24, 25, 31)),
+    ("Средства разработчика", 15, (15,)),
+    ("Развлечения", 16, (16,)),
+    ("Музыка", 17, (17,)),
+    ("Личные финансы", 18, (18,)),
+    ("Образование", 19, (19,)),
+    ("Служебные", 20, (20,)),
+    ("Спорт", 26, (26,)),
+    ("Стиль жизни", 27, (27,)),
+    ("Покупки", 28, (28,)),
+    ("Еда и питание", 29, (29,)),
+    ("(Категория без названия)", 32, ()),   # все номера 32 и выше
+]
+START_OTHER = 0      # «Другое» (значение 0); всё неизвестное (отрицательное и т.п.) тоже сюда
+START_UNNAMED = 32   # номера 32+ — «категория без названия»; при записи используется 32
+START_NAMES = [c[0] for c in START_CATS]
+START_VALUES = [c[1] for c in START_CATS]
+START_GROUP = {v: c[1] for c in START_CATS for v in c[2]}
+START_LABEL = {c[1]: c[0] for c in START_CATS}
+
+_PS_START_APPS = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$a = @(Get-StartApps | ForEach-Object { [pscustomobject]@{ n = $_.Name; i = $_.AppID } })
+ConvertTo-Json -InputObject $a -Compress
+"""
+
+
+def start_group(v: int) -> int:
+    if v >= START_UNNAMED:
+        return START_UNNAMED
+    return START_GROUP.get(v, START_OTHER)
+
+
+def start_label(v: int) -> str:
+    return START_LABEL[start_group(v)]
+
+
+def start_app_id(rel: str) -> str:
+    """«P~Пакет!App» -> «Пакет!App»; «W~{GUID}\\x.exe» -> «{GUID}\\x.exe» (так же, как AppID в Get-StartApps)."""
+    return rel[2:] if rel[:2] in ("P~", "W~") else rel
+
+
+def start_fallback_name(rel: str) -> str:
+    app_id = start_app_id(rel)
+    if rel.startswith("P~"):
+        return app_id.split("!")[0].split("_")[0]
+    last = app_id.rsplit("\\", 1)[-1]
+    base, ext = os.path.splitext(last)
+    return base if ext.lower() in (".exe", ".lnk", ".chm", ".msc", ".cpl", ".url", ".bat", ".cmd") else last
+
+
+def scan_start_tiles() -> list[tuple[str, int]]:
+    """[(путь ключа относительно TileProperties, Category)] — ключи могут быть вложенными (W~{GUID}\\app.exe)."""
+    out: list[tuple[str, int]] = []
+
+    def walk(rel: str):
+        path = START_KEY + (f"\\{rel}" if rel else "")
+        subs = []
+        try:
+            with winreg.OpenKey(HKCU, path, 0, R) as k:
+                if rel:
+                    try:
+                        v, t = winreg.QueryValueEx(k, "Category")
+                        if t == winreg.REG_DWORD:
+                            out.append((rel, int(v)))
+                    except OSError:
+                        pass
+                i = 0
+                while True:
+                    try:
+                        subs.append(winreg.EnumKey(k, i))
+                        i += 1
+                    except OSError:
+                        break
+        except OSError:
+            return
+        for s in subs:
+            walk(f"{rel}\\{s}" if rel else s)
+
+    walk("")
+    return out
+
+
+def set_start_category(rel: str, value: int):
+    with winreg.OpenKey(HKCU, f"{START_KEY}\\{rel}", 0, SW) as k:
+        winreg.SetValueEx(k, "Category", 0, winreg.REG_DWORD, value)
+
+
+def backup_start(apps: list["StartApp"]) -> Path:
+    START_BACKUPS.mkdir(parents=True, exist_ok=True)
+    f = START_BACKUPS / f"{datetime.now():%Y%m%d_%H%M%S}.json"
+    f.write_text(json.dumps({"key": START_KEY, "categories": {a.rel: a.category for a in apps}},
+                            ensure_ascii=False, indent=2), encoding="utf-8")
+    return f
+
+
+def latest_start_backup() -> Path | None:
+    files = sorted(START_BACKUPS.glob("*.json")) if START_BACKUPS.exists() else []
+    return files[-1] if files else None
+
+
+def restore_start(file: Path) -> int:
+    cats = json.loads(Path(file).read_text(encoding="utf-8")).get("categories", {})
+    done = 0
+    for rel, v in cats.items():
+        try:
+            set_start_category(rel, int(v))
+            done += 1
+        except OSError:
+            continue   # приложение удалено — ключа уже нет
+    return done
+
+
+# ── «Найти удалённые»: записи TileProperties от приложений, которых уже нет ──
+
+_PS_START_STATE = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$apps = @(Get-StartApps | ForEach-Object { [string]$_.AppID })
+$pkgs = @(Get-AppxPackage | ForEach-Object { [string]$_.PackageFamilyName })
+ConvertTo-Json -InputObject ([pscustomobject]@{ apps = $apps; pkgs = $pkgs }) -Compress
+"""
+
+
+def _known_folder(guid: str) -> str:
+    """{GUID известной папки} -> путь (например, Program Files) или '' если не удалось."""
+    try:
+        rfid = _GUID.from_buffer_copy(uuid.UUID(guid).bytes_le)
+    except ValueError:
+        return ""
+    ptr = ctypes.c_wchar_p()
+    if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(rfid), 0, None, ctypes.byref(ptr)) != 0:
+        return ""
+    try:
+        return ptr.value or ""
+    finally:
+        ctypes.windll.ole32.CoTaskMemFree(ctypes.cast(ptr, ctypes.c_void_p))
+
+
+def _tile_target(app_id: str) -> str:
+    """Путь к файлу классического приложения из AppID: «{GUID}\\папка\\x.exe» или обычный путь. Иначе ''."""
+    m = re.match(r"^\{([0-9A-Fa-f-]{36})\}[\\/](.+)$", app_id)
+    if m:
+        base = _known_folder(m.group(1))
+        return os.path.join(base, m.group(2)) if base else ""
+    p = os.path.expandvars(app_id)
+    return p if re.match(r"^[A-Za-z]:[\\/]", p) else ""
+
+
+def find_ghost_tiles(tiles: list[tuple[str, int]]) -> list[tuple[str, str]]:
+    """[(ключ, причина)] — записи, у которых приложения уже нет.
+    Осторожно: запись считается «призраком», только если приложения нет в Get-StartApps И
+    (Store) пакет не установлен / (классическое) файл по пути из AppID не существует.
+    Всё, в чём нельзя быть уверенным, остаётся нетронутым."""
+    raw = _ps(_PS_START_STATE)
+    data = json.loads(raw) if raw else {}
+
+    def as_set(v) -> set[str]:
+        if isinstance(v, str):
+            v = [v]
+        return {str(x).lower() for x in (v or [])}
+
+    apps, pkgs = as_set(data.get("apps")), as_set(data.get("pkgs"))
+    if not apps:
+        raise RuntimeError("Get-StartApps вернул пустой список — определить удалённые приложения нельзя")
+    out: list[tuple[str, str]] = []
+    for rel, _ in tiles:
+        app_id = start_app_id(rel)
+        if app_id.lower() in apps:
+            continue
+        if rel.startswith("P~"):
+            pfn = app_id.split("!")[0].lower()
+            if pkgs and pfn and pfn not in pkgs:
+                out.append((rel, "Пакет Store не установлен"))
+            continue
+        path = _tile_target(app_id)
+        if path and not os.path.exists(path):
+            out.append((rel, f"Файл не найден: {path}"))
+    return out
+
+
+def delete_start_tile(rel: str):
+    """Удаляет ключ приложения из TileProperties (и опустевшие родительские ключи W~{GUID})."""
+    path = f"{START_KEY}\\{rel}"
+    with winreg.OpenKey(HKCU, path, 0, W) as k:
+        try:
+            winreg.EnumKey(k, 0)
+            has_sub = True
+        except OSError:
+            has_sub = False
+        if has_sub:                        # вложенные ключи — чужие приложения, их не трогаем
+            winreg.DeleteValue(k, "Category")
+            return
+    winreg.DeleteKeyEx(HKCU, path, winreg.KEY_WOW64_64KEY, 0)
+    parent = rel.rpartition("\\")[0]
+    while parent:
+        ppath = f"{START_KEY}\\{parent}"
+        try:
+            with winreg.OpenKey(HKCU, ppath, 0, W) as pk:
+                nsub, nval, _ = winreg.QueryInfoKey(pk)
+            if nsub or nval:
+                break
+            winreg.DeleteKeyEx(HKCU, ppath, winreg.KEY_WOW64_64KEY, 0)
+        except OSError:
+            break
+        parent = parent.rpartition("\\")[0]
+
+
+# ── значки приложений: IShellItemImageFactory через ctypes (без pywin32) ──
+
+class _SIZE(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_long), ("cy", ctypes.c_long)]
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("a", ctypes.c_uint32), ("b", ctypes.c_uint16), ("c", ctypes.c_uint16),
+                ("d", ctypes.c_ubyte * 8)]
+
+
+class _BITMAP(ctypes.Structure):
+    _fields_ = [("bmType", ctypes.c_long), ("bmWidth", ctypes.c_long), ("bmHeight", ctypes.c_long),
+                ("bmWidthBytes", ctypes.c_long), ("bmPlanes", ctypes.c_ushort),
+                ("bmBitsPixel", ctypes.c_ushort), ("bmBits", ctypes.c_void_p)]
+
+
+class _BMIH(ctypes.Structure):
+    _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_long), ("biHeight", ctypes.c_long),
+                ("biPlanes", ctypes.c_ushort), ("biBitCount", ctypes.c_ushort),
+                ("biCompression", ctypes.c_uint32), ("biSizeImage", ctypes.c_uint32),
+                ("biXPelsPerMeter", ctypes.c_long), ("biYPelsPerMeter", ctypes.c_long),
+                ("biClrUsed", ctypes.c_uint32), ("biClrImportant", ctypes.c_uint32)]
+
+
+def shell_icon_bits(app_id: str, size: int = 32):
+    """BGRA-пиксели значка приложения из shell:AppsFolder\\<AppID> -> (w, h, bytes) или None."""
+    vp = ctypes.c_void_p
+    shell32, gdi32, user32 = ctypes.windll.shell32, ctypes.windll.gdi32, ctypes.windll.user32
+    create = shell32.SHCreateItemFromParsingName
+    create.argtypes = [ctypes.c_wchar_p, vp, ctypes.POINTER(_GUID), ctypes.POINTER(vp)]
+    create.restype = ctypes.c_long
+    gdi32.GetObjectW.argtypes = [vp, ctypes.c_int, vp]
+    gdi32.GetDIBits.argtypes = [vp, vp, ctypes.c_uint, ctypes.c_uint, vp, vp, ctypes.c_uint]
+    gdi32.DeleteObject.argtypes = [vp]
+    user32.GetDC.argtypes = [vp]
+    user32.GetDC.restype = vp
+    user32.ReleaseDC.argtypes = [vp, vp]
+
+    iid = _GUID.from_buffer_copy(uuid.UUID("BCC18B79-BA16-442F-80C4-8A59C30C463B").bytes_le)
+    obj = vp()
+    if create("shell:AppsFolder\\" + app_id, None, ctypes.byref(iid), ctypes.byref(obj)) < 0 or not obj.value:
+        return None
+    vt = ctypes.cast(ctypes.cast(obj, ctypes.POINTER(vp))[0], ctypes.POINTER(vp))
+    release = ctypes.WINFUNCTYPE(ctypes.c_ulong, vp)(vt[2])
+    get_image = ctypes.WINFUNCTYPE(ctypes.c_long, vp, _SIZE, ctypes.c_uint, ctypes.POINTER(vp))(vt[3])
+    hbm = vp()
+    try:
+        if get_image(obj, _SIZE(size, size), 0x4, ctypes.byref(hbm)) < 0 or not hbm.value:   # SIIGBF_ICONONLY
+            return None
+    finally:
+        release(obj)
+    try:
+        bm = _BITMAP()
+        gdi32.GetObjectW(hbm, ctypes.sizeof(bm), ctypes.byref(bm))
+        w, h = bm.bmWidth, bm.bmHeight
+        if w <= 0 or h <= 0:
+            return None
+        bmi = _BMIH()
+        bmi.biSize, bmi.biWidth, bmi.biHeight = ctypes.sizeof(_BMIH), w, -h
+        bmi.biPlanes, bmi.biBitCount = 1, 32
+        buf = ctypes.create_string_buffer(w * h * 4)
+        hdc = user32.GetDC(None)
+        try:
+            gdi32.GetDIBits(hdc, hbm, 0, h, buf, ctypes.byref(bmi), 0)
+        finally:
+            user32.ReleaseDC(None, hdc)
+        data = bytearray(buf.raw)
+        if not any(data[3::4]):          # у части значков нет альфа-канала
+            data[3::4] = b"\xff" * (w * h)
+        return w, h, bytes(data)
+    finally:
+        gdi32.DeleteObject(hbm)
+
+
+@dataclass
+class StartApp:
+    rel: str
+    name: str
+    category: int
+
+    @property
+    def kind(self) -> str:
+        return "Приложение Store" if self.rel.startswith("P~") else "Классическое"
+
+
+class CategoryList(ListWidget):
+    """Список приложений одной категории: принимает перетаскивание из других списков."""
+    dropped = pyqtSignal(list, int)          # (ключи приложений, номер категории-приёмника)
+
+    def __init__(self, value: int, parent=None):
+        super().__init__(parent)
+        self.value = value
+        self._hover = False
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(False)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setIconSize(QSize(22, 22))
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+    def _set_hover(self, on: bool):
+        if self._hover != on:
+            self._hover = on
+            self.viewport().update()
+
+    def _accepts(self, e) -> bool:
+        src = e.source()
+        return isinstance(src, CategoryList) and src is not self
+
+    def dragEnterEvent(self, e):
+        if self._accepts(e):
+            e.setDropAction(Qt.DropAction.MoveAction)
+            e.accept()
+            self._set_hover(True)
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        if self._accepts(e):
+            super().dragMoveEvent(e)                 # автопрокрутка у краёв списка
+            e.setDropAction(Qt.DropAction.MoveAction)
+            e.accept()
+        else:
+            e.ignore()
+
+    def dragLeaveEvent(self, e):
+        self._set_hover(False)
+        super().dragLeaveEvent(e)
+
+    def dropEvent(self, e):
+        self._set_hover(False)
+        if not self._accepts(e):
+            e.ignore()
+            return
+        rels = [it.data(Qt.ItemDataRole.UserRole) for it in e.source().selectedItems()]
+        # IgnoreAction: Qt сам ничего не переносит и не удаляет — список перестроит страница
+        e.setDropAction(Qt.DropAction.IgnoreAction)
+        e.accept()
+        if rels:
+            self.dropped.emit(rels, self.value)
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.viewport().rect()
+        if self.count() == 0:
+            p.setPen(QColor(128, 128, 128))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, "Перетащите сюда")
+        if self._hover:
+            fill = QColor(themeColor())
+            fill.setAlpha(28)
+            p.setBrush(fill)
+            p.setPen(QPen(themeColor(), 2))
+            p.drawRoundedRect(r.adjusted(2, 2, -2, -2), 6, 6)
+        p.end()
+
+
+class GhostDialog(MessageBoxBase):
+    """Подтверждение удаления одной записи. «Пропустить» — оставить, «Остановить» — прекратить обход."""
+
+    def __init__(self, parent, pos: int, total: int, app: "StartApp", reason: str):
+        super().__init__(parent)
+        self.stopped = False
+        self.viewLayout.addWidget(SubtitleLabel(f"Удалить запись из реестра? ({pos} из {total})"))
+        self.viewLayout.addWidget(StrongBodyLabel(app.name))
+        for text in (reason, f"HKEY_CURRENT_USER\\{START_KEY}\\{app.rel}"):
+            lbl = CaptionLabel(text)
+            lbl.setWordWrap(True)
+            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.viewLayout.addWidget(lbl)
+        self.yesButton.setText("Удалить")
+        self.cancelButton.setText("Пропустить")
+        stop = PushButton("Остановить")
+        stop.clicked.connect(self._stop)
+        self.buttonLayout.addWidget(stop)
+        self.widget.setMinimumWidth(520)
+
+    def _stop(self):
+        self.stopped = True
+        self.reject()
+
+
+class StartMenuPage(QWidget):
+    _loaded = pyqtSignal(list, dict)
+    _icons = pyqtSignal(dict)
+    _ghosts = pyqtSignal(list, str)
+    COLS = 6
+
+    def __init__(self, win: "MainWindow"):
+        super().__init__()
+        self.setObjectName("startMenuPage")
+        self.win = win
+        self.apps: list[StartApp] = []
+        self.by_rel: dict[str, StartApp] = {}
+        self.items: dict[str, QListWidgetItem] = {}
+        self.lists: dict[int, CategoryList] = {}
+        self.counts: dict[int, CaptionLabel] = {}
+        self._loading = False
+        self._backed_up = False
+        self._scanning = False
+        self.icons: dict[str, QIcon] = {}
+        self._icon_tried: set[str] = set()
+        self._loaded.connect(self._on_loaded)
+        self._icons.connect(self._on_icons)
+        self._ghosts.connect(self._on_ghosts)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(32, 20, 32, 20)
+        root.setSpacing(10)
+        root.addWidget(TitleLabel("Пуск"))
+        root.addWidget(BodyLabel("Категория каждого приложения в разделе «Все» меню «Пуск» (режим «По категориям»). "
+                                 "Перетаскивайте приложения мышью в нужную категорию — можно сразу несколько "
+                                 "(Ctrl / Shift). Правая кнопка мыши — «Переместить в…»."))
+
+        self.warn = CaptionLabel("В реестре нет приложений с категорией. Откройте «Пуск» → «Все» в режиме "
+                                 "«По категориям» и нажмите «Обновить».")
+        self.warn.setStyleSheet("color:#d13438;")
+        self.warn.hide()
+        root.addWidget(self.warn)
+
+        top = QHBoxLayout()
+        self.search = SearchLineEdit()
+        self.search.setPlaceholderText("Поиск по названию или ключу реестра")
+        self.search.setFixedWidth(260)
+        self.search.textChanged.connect(self.refilter)
+        top.addWidget(self.search)
+        top.addStretch(1)
+        self.stats = CaptionLabel("")
+        top.addWidget(self.stats)
+        top.addSpacing(12)
+        self.btn_ghosts = PushButton(fic("SEARCH"), "Найти удалённые", self)
+        for btn, slot in ((PushButton(fic("SYNC"), "Обновить", self), self.reload),
+                          (PushButton(fic("CLEAR_SELECTION"), "Разгруппировать", self), self.ungroup),
+                          (self.btn_ghosts, self.find_ghosts),
+                          (PushButton(fic("HISTORY"), "Откатить из копии", self), self.rollback),
+                          (PushButton(fic("ROTATE"), "Перезапустить Проводник", self), self.restart)):
+            btn.clicked.connect(slot)
+            top.addWidget(btn)
+        root.addLayout(top)
+
+        # доска категорий: сетка из COLS колонок, каждая ячейка — карточка со своим списком
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        for i, (name, value, _) in enumerate(START_CATS):
+            card = SimpleCardWidget(self)
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(10, 10, 10, 10)
+            cl.setSpacing(6)
+            head = QHBoxLayout()
+            title = StrongBodyLabel(name)
+            title.setWordWrap(True)
+            cnt = CaptionLabel("0")
+            head.addWidget(title, 1)
+            head.addWidget(cnt, 0, Qt.AlignmentFlag.AlignTop)
+            cl.addLayout(head)
+            lst = CategoryList(value)
+            lst.dropped.connect(self._on_drop)
+            lst.itemSelectionChanged.connect(lambda l=lst: self._on_sel(l))
+            lst.customContextMenuRequested.connect(lambda pos, l=lst: self._context_menu(l, pos))
+            cl.addWidget(lst, 1)
+            grid.addWidget(card, i // self.COLS, i % self.COLS)
+            self.lists[value] = lst
+            self.counts[value] = cnt
+        for c in range(self.COLS):
+            grid.setColumnStretch(c, 1)
+        for r in range((len(START_CATS) + self.COLS - 1) // self.COLS):
+            grid.setRowStretch(r, 1)
+        root.addLayout(grid, 1)
+
+        self.detail = CaptionLabel("")
+        self.detail.setWordWrap(True)
+        self.detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        root.addWidget(self.detail)
+        root.addWidget(CaptionLabel("Изменения применяются после перезапуска Проводника (или повторного входа в "
+                                    "систему). Перед первым изменением за сеанс программа сохраняет копию "
+                                    "всех категорий. Номера категорий в Windows не документированы."))
+        self.show_detail()
+
+        QTimer.singleShot(0, self.reload)
+
+    # ── служебное ──
+    def toast(self, kind: str, title: str, text: str = ""):
+        getattr(InfoBar, kind)(title=title, content=text, orient=Qt.Orientation.Horizontal,
+                               isClosable=True, position=InfoBarPosition.TOP_RIGHT,
+                               duration=4000, parent=self.win)
+
+    def selected(self) -> list[StartApp]:
+        out = []
+        for lst in self.lists.values():
+            for it in lst.selectedItems():
+                a = self.by_rel.get(it.data(Qt.ItemDataRole.UserRole))
+                if a:
+                    out.append(a)
+        return out
+
+    # ── данные ──
+    def reload(self):
+        if self._loading:
+            return
+        self._loading = True
+        self.stats.setText("Загрузка…")
+        threading.Thread(target=self._load_worker, daemon=True).start()
+
+    def _load_worker(self):
+        tiles = scan_start_tiles()
+        names: dict[str, str] = {}
+        try:   # красивые названия берём у самой Windows (Get-StartApps)
+            raw = _ps(_PS_START_APPS)
+            data = json.loads(raw) if raw else []
+            if isinstance(data, dict):
+                data = [data]
+            names = {str(d.get("i", "")).lower(): str(d.get("n", "")) for d in data if d.get("i")}
+        except Exception:  # noqa: BLE001
+            pass
+        self._loaded.emit(tiles, names)
+
+    def _on_loaded(self, tiles: list, names: dict):
+        keep = {a.rel for a in self.selected()}
+        self._loading = False
+        self.apps = [StartApp(rel, names.get(start_app_id(rel).lower()) or start_fallback_name(rel), v)
+                     for rel, v in tiles]
+        self.by_rel = {a.rel: a for a in self.apps}
+        self.warn.setVisible(not self.apps)
+        self.refilter(keep=keep)
+        todo = [(a.rel, start_app_id(a.rel)) for a in self.apps if a.rel not in self._icon_tried]
+        self._icon_tried.update(r for r, _ in todo)
+        if todo:
+            threading.Thread(target=self._icon_worker, args=(todo,), daemon=True).start()
+
+    def _icon_worker(self, todo: list):
+        try:
+            ctypes.windll.ole32.CoInitializeEx(None, 2)   # STA
+        except Exception:  # noqa: BLE001
+            pass
+        batch: dict = {}
+        for rel, app_id in todo:
+            try:
+                bits = shell_icon_bits(app_id)
+            except Exception:  # noqa: BLE001
+                bits = None
+            if bits:
+                batch[rel] = bits
+            if len(batch) >= 20:
+                self._icons.emit(batch)
+                batch = {}
+        if batch:
+            self._icons.emit(batch)
+        try:
+            ctypes.windll.ole32.CoUninitialize()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_icons(self, batch: dict):
+        for rel, (w, h, data) in batch.items():
+            img = QImage(data, w, h, w * 4, QImage.Format.Format_ARGB32_Premultiplied).copy()
+            self.icons[rel] = QIcon(QPixmap.fromImage(img))
+            item = self.items.get(rel)
+            if item is not None:
+                try:
+                    item.setIcon(self.icons[rel])
+                except RuntimeError:     # элемент уже удалён при перестроении
+                    pass
+
+    def refilter(self, *_, keep=None):
+        """Перестраивает доску: раскладывает приложения по спискам с учётом поиска."""
+        keep = keep if keep is not None else {a.rel for a in self.selected()}
+        q = self.search.text().strip().lower()
+        shown = [a for a in self.apps if not q or q in a.name.lower() or q in a.rel.lower()]
+        shown.sort(key=lambda a: a.name.casefold())
+        default_icon = fic("APPLICATION").icon()
+
+        for lst in self.lists.values():
+            lst.blockSignals(True)
+            lst.clear()
+        self.items = {}
+        for a in shown:
+            lst = self.lists[start_group(a.category)]
+            it = QListWidgetItem(self.icons.get(a.rel, default_icon), a.name)
+            it.setData(Qt.ItemDataRole.UserRole, a.rel)
+            it.setToolTip(f"{a.name}\n{a.kind}\nCategory = {a.category}\n{a.rel}")
+            lst.addItem(it)
+            self.items[a.rel] = it
+            if a.rel in keep:
+                it.setSelected(True)
+        for v, lst in self.lists.items():
+            lst.blockSignals(False)
+            lst.viewport().update()
+            self.counts[v].setText(str(lst.count()))
+        self.stats.setText(f"Всего: {len(self.apps)} · показано: {len(shown)}")
+        self.show_detail()
+
+    def _on_sel(self, lst: CategoryList):
+        """Выделение живёт только в одном списке — тот, откуда будем тащить."""
+        if lst.selectedItems():
+            for other in self.lists.values():
+                if other is not lst and other.selectedItems():
+                    other.blockSignals(True)
+                    other.clearSelection()
+                    other.blockSignals(False)
+        self.show_detail()
+
+    def _context_menu(self, lst: CategoryList, pos):
+        it = lst.itemAt(pos)
+        if it is None:
+            return
+        if not it.isSelected():
+            lst.clearSelection()
+            it.setSelected(True)
+        rels = [i.data(Qt.ItemDataRole.UserRole) for i in lst.selectedItems()]
+        menu = QMenu(self)
+        sub = menu.addMenu("Переместить в…")
+        for name, value, _ in START_CATS:
+            if value != lst.value:
+                act = sub.addAction(name)
+                act.triggered.connect(lambda _=False, v=value: self._move(rels, v))
+        menu.exec(lst.viewport().mapToGlobal(pos))
+
+    def show_detail(self):
+        sel = self.selected()
+        if not sel:
+            self.detail.setText("Перетащите приложение (или несколько выделенных) в нужную категорию.")
+        elif len(sel) == 1:
+            a = sel[0]
+            self.detail.setText(f"Реестр: HKEY_CURRENT_USER\\{START_KEY}\\{a.rel}   |   Category = {a.category}")
+        else:
+            self.detail.setText(f"Выбрано приложений: {len(sel)}")
+
+    # ── действия ──
+    def _on_drop(self, rels: list, value: int):
+        # откладываем: нельзя перестраивать список, пока Qt ещё завершает перетаскивание
+        QTimer.singleShot(0, lambda: self._move(rels, value))
+
+    def _move(self, rels: list, value: int):
+        apps = [self.by_rel[r] for r in rels if r in self.by_rel]
+        if not apps:
+            return
+        todo = [a for a in apps if start_group(a.category) != value]
+        if not todo:
+            return self.toast("info", "Уже в этой категории")
+        keep = {a.rel for a in apps}
+        changed = 0
+        try:
+            if not self._backed_up:
+                backup_start(self.apps)
+                self._backed_up = True
+            for a in todo:
+                set_start_category(a.rel, value)
+                a.category = value
+                changed += 1
+        except Exception as ex:  # noqa: BLE001
+            self.toast("error", "Ошибка", str(ex))
+        else:
+            notify_shell()
+            self.toast("success", f"Перемещено: {changed} → «{START_LABEL[value]}»",
+                       "Перезапустите Проводник, чтобы «Пуск» обновился.")
+        finally:
+            self.refilter(keep=keep)
+
+    def ungroup(self):
+        """Category = 0 для всех приложений (не только показанных поиском)."""
+        todo = [a for a in self.apps if a.category != 0]
+        if not todo:
+            return self.toast("info", "Нечего разгруппировывать", "У всех приложений уже Category = 0.")
+        box = MessageBox("Разгруппировать все приложения?",
+                         f"Category = 0 будет записан для приложений: {len(todo)} из {len(self.apps)}. "
+                         "Все они окажутся в «Другое». Перед этим сохранится копия — вернуть категории "
+                         "можно кнопкой «Откатить из копии».", self.win)
+        box.yesButton.setText("Разгруппировать")
+        box.cancelButton.setText("Отмена")
+        if not box.exec():
+            return
+        changed = 0
+        try:
+            if not self._backed_up:
+                backup_start(self.apps)
+                self._backed_up = True
+            for a in todo:
+                set_start_category(a.rel, 0)
+                a.category = 0
+                changed += 1
+        except Exception as ex:  # noqa: BLE001
+            self.toast("error", "Ошибка", str(ex))
+        else:
+            notify_shell()
+            self.toast("success", f"Разгруппировано: {changed}",
+                       "Перезапустите Проводник, чтобы «Пуск» обновился.")
+        finally:
+            self.refilter()
+
+    def find_ghosts(self):
+        if self._scanning or self._loading:
+            return
+        if not self.apps:
+            return self.toast("info", "Список пуст", "Сначала нажмите «Обновить».")
+        self._scanning = True
+        self.btn_ghosts.setEnabled(False)
+        self.stats.setText("Поиск удалённых…")
+        tiles = [(a.rel, a.category) for a in self.apps]
+        threading.Thread(target=self._ghost_worker, args=(tiles,), daemon=True).start()
+
+    def _ghost_worker(self, tiles: list):
+        try:
+            found, err = find_ghost_tiles(tiles), ""
+        except Exception as ex:  # noqa: BLE001
+            found, err = [], str(ex)
+        self._ghosts.emit(found, err)
+
+    def _on_ghosts(self, found: list, err: str):
+        self._scanning = False
+        self.btn_ghosts.setEnabled(True)
+        self.refilter()                                   # возвращает строку статистики
+        if err:
+            return self.toast("error", "Не удалось проверить", err)
+        if not found:
+            return self.toast("info", "Удалённых приложений не найдено")
+        deleted = 0
+        for i, (rel, reason) in enumerate(found, 1):
+            app = self.by_rel.get(rel)
+            if app is None:
+                continue
+            dlg = GhostDialog(self.win, i, len(found), app, reason)
+            if dlg.exec():
+                try:
+                    if not self._backed_up:
+                        backup_start(self.apps)
+                        self._backed_up = True
+                    delete_start_tile(rel)
+                    deleted += 1
+                except Exception as ex:  # noqa: BLE001
+                    self.toast("error", f"Не удалось удалить «{app.name}»", str(ex))
+            elif dlg.stopped:
+                break
+        if deleted:
+            notify_shell()
+            self.toast("success", f"Удалено записей: {deleted}")
+            self.reload()
+        else:
+            self.toast("info", "Ничего не удалено")
+
+    def rollback(self):
+        f = latest_start_backup()
+        if not f:
+            return self.toast("info", "Копий пока нет", "Копия создаётся перед первым изменением.")
+        try:
+            when = datetime.strptime(f.stem, "%Y%m%d_%H%M%S").strftime("%d.%m.%Y %H:%M:%S")
+        except ValueError:
+            when = f.stem
+        box = MessageBox("Откатить категории?",
+                         f"Категории всех приложений вернутся к состоянию на {when}.", self.win)
+        box.yesButton.setText("Откатить")
+        box.cancelButton.setText("Отмена")
+        if not box.exec():
+            return
+        try:
+            n = restore_start(f)
+        except Exception as ex:  # noqa: BLE001
+            return self.toast("error", "Ошибка", str(ex))
+        notify_shell()
+        self.toast("success", f"Восстановлено приложений: {n}", "Перезапустите Проводник, чтобы «Пуск» обновился.")
+        self.reload()
+
+    def restart(self):
+        box = MessageBox("Перезапустить Проводник?",
+                         "Окна Проводника закроются и откроются заново — после этого «Пуск» "
+                         "подхватит новые категории.", self.win)
+        box.yesButton.setText("Перезапустить")
+        box.cancelButton.setText("Отмена")
+        if box.exec():
+            try:
+                restart_explorer()
+            except Exception as ex:  # noqa: BLE001
+                return self.toast("error", "Ошибка", str(ex))
+            self.toast("success", "Проводник перезапущен")
+
+
 class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
-        self.resize(1200, 780)
+        self.start_maximized = False
+        self._restore_geometry()
         self.menu_page = NewMenuPage(self)
+        self.start_page = StartMenuPage(self)
         self.backup_page = BackupPage(self)
         self.addSubInterface(self.menu_page, fic("ADD"), "Меню «Создать»")
+        self.addSubInterface(self.start_page, fic("HOME"), "Пуск")
         self.addSubInterface(self.backup_page, fic("HISTORY"), "Резервные копии")
         self.stackedWidget.currentChanged.connect(
             lambda _: self.backup_page.refresh() if self.stackedWidget.currentWidget() is self.backup_page else None)
+
+    def _restore_geometry(self):
+        """Размер по умолчанию подгоняется под экран и центрируется; прошлые позиция/размер запоминаются."""
+        scr = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        area = scr.availableGeometry()
+        self.setMinimumSize(min(900, area.width()), min(560, area.height()))
+        w, h = min(1200, int(area.width() * 0.9)), min(780, int(area.height() * 0.9))
+        rect = QRect(area.x() + (area.width() - w) // 2, area.y() + (area.height() - h) // 2, w, h)
+        try:
+            d = json.loads(WINDOW_FILE.read_text(encoding="utf-8"))
+            saved = QRect(int(d["x"]), int(d["y"]), int(d["w"]), int(d["h"]))
+            for s in QApplication.screens():
+                vis = s.availableGeometry().intersected(saved)
+                if saved.width() > 0 and vis.width() * vis.height() >= 0.6 * saved.width() * saved.height():
+                    rect = saved
+                    self.start_maximized = bool(d.get("max", False))
+                    break
+        except Exception:  # noqa: BLE001
+            pass
+        self.setGeometry(rect)
+
+    def closeEvent(self, e):
+        try:
+            g = self.normalGeometry() if self.isMaximized() else self.geometry()
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            WINDOW_FILE.write_text(json.dumps({"x": g.x(), "y": g.y(), "w": g.width(), "h": g.height(),
+                                               "max": self.isMaximized()}), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+        super().closeEvent(e)
 
 
 def main():
@@ -1200,7 +2053,7 @@ def main():
     except Exception:
         setTheme(Theme.LIGHT)
     w = MainWindow()
-    w.show()
+    w.showMaximized() if w.start_maximized else w.show()
     sys.exit(app.exec())
 
 
